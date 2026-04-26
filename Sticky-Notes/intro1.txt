@@ -1,0 +1,3 @@
+WELCOME TO STICKIES!
+
+Stickies lets you write notes (like these) and stick them to your screen. You can use stickies to jot quick notes, to write reminders, or to store frequently used text. Your notes are visible whenever the stickies program is active.
