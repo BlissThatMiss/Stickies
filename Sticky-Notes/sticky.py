@@ -8,10 +8,10 @@ import threading
 import traceback
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GdkPixbuf, Gdk, Pango, GLib
+import cairo
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
-# socket path for single-instance signalling
 SOCKET_PATH = os.path.join(BASE_DIR, "stickies.sock")
 
 
@@ -30,6 +30,121 @@ def save_settings(settings):
         json.dump(settings, f, indent=2)
 
 
+def pixbuf_to_cairo_surface(pixbuf):
+    """Convert a GdkPixbuf to a cairo ImageSurface."""
+    has_alpha = pixbuf.get_has_alpha()
+    fmt = cairo.FORMAT_ARGB32 if has_alpha else cairo.FORMAT_RGB24
+    w, h = pixbuf.get_width(), pixbuf.get_height()
+    surf = cairo.ImageSurface(fmt, w, h)
+    cr = cairo.Context(surf)
+    Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, 0)
+    cr.paint()
+    return surf
+
+
+class NineSliceDrawingArea(Gtk.DrawingArea):
+    """
+    A single DrawingArea that renders the full 9-slice texture.
+    Natural size is always 0x0 — it NEVER imposes a size floor,
+    which is the key property that allows the window to shrink freely.
+    """
+    def __init__(self):
+        super().__init__()
+        self.pixbufs = None
+        self._surfaces = {}
+        self.connect("draw", self._on_draw)
+        # Zero natural size — this is the whole point of using DrawingArea
+        self.set_size_request(1, 1)
+
+    def set_pixbufs(self, pixbufs):
+        self.pixbufs = pixbufs
+        self._surfaces = {}
+        for k, pb in pixbufs.items():
+            self._surfaces[k] = pixbuf_to_cairo_surface(pb)
+        self.queue_draw()
+
+    def _on_draw(self, widget, cr):
+        if not self.pixbufs:
+            return
+        alloc = self.get_allocation()
+        W, H = alloc.width, alloc.height
+
+        pb = self.pixbufs
+        # All layout values are kept as plain ints so every rectangle is
+        # pixel-perfect with no sub-pixel gaps or overlaps at the seams.
+        lw = int(pb["l"].get_width())
+        rw = int(pb["r"].get_width())
+        th = int(pb["t"].get_height())
+        bh = int(pb["b"].get_height())
+        mid_w = max(1, W - lw - rw)
+        mid_h = max(1, H - th - bh)
+
+        def draw_slice(key, dst_x, dst_y, dst_w, dst_h):
+            """
+            Draw a single slice scaled to (dst_w x dst_h) at (dst_x, dst_y).
+            Uses a SurfacePattern with an explicit scaling matrix instead of
+            cr.scale(), so the transform never leaks outside the clip rect and
+            bilinear filtering cannot bleed edge pixels across seam boundaries.
+            """
+            src = self._surfaces[key]
+            src_w = src.get_width()
+            src_h = src.get_height()
+            if dst_w <= 0 or dst_h <= 0:
+                return
+            pat = cairo.SurfacePattern(src)
+            # Map source pixels → destination pixels via an inverse matrix
+            # (cairo patterns are specified in source space)
+            sx = src_w / dst_w
+            sy = src_h / dst_h
+            mat = cairo.Matrix()
+            mat.scale(sx, sy)
+            mat.translate(-dst_x, -dst_y)
+            pat.set_matrix(mat)
+            # FILTER_NEAREST is the key fix: bilinear interpolation samples pixels
+            # outside the source boundary and bleeds them across seams, producing
+            # the gray shadow lines. NEAREST has no such kernel — hard pixel edges.
+            pat.set_filter(cairo.FILTER_NEAREST)
+            pat.set_extend(cairo.EXTEND_PAD)
+            cr.save()
+            cr.rectangle(dst_x, dst_y, dst_w, dst_h)
+            cr.clip()
+            cr.set_source(pat)
+            cr.paint()
+            cr.restore()
+
+        def draw_tiled_h(key, dst_x, dst_y, dst_w, dst_h):
+            """Tile a slice horizontally (used for the top edge)."""
+            src = self._surfaces[key]
+            src_w = src.get_width()
+            if dst_w <= 0 or dst_h <= 0:
+                return
+            cr.save()
+            cr.rectangle(dst_x, dst_y, dst_w, dst_h)
+            cr.clip()
+            x = dst_x
+            while x < dst_x + dst_w:
+                cr.set_source_surface(src, x, dst_y)
+                cr.get_source().set_filter(cairo.FILTER_NEAREST)
+                cr.paint()
+                x += src_w
+            cr.restore()
+
+        # Corners — drawn at their native pixel size, no scaling needed.
+        draw_slice("tl", 0,      0,      lw,    th)
+        draw_slice("tr", W - rw, 0,      rw,    th)
+        draw_slice("bl", 0,      H - bh, lw,    bh)
+        draw_slice("br", W - rw, H - bh, rw,    bh)
+
+        # Edges — mid_w / mid_h are exact ints, so no fractional seams.
+        draw_tiled_h("t", lw,     0,      mid_w, th)
+        draw_slice("b",   lw,     H - bh, mid_w, bh)
+        draw_slice("l",   0,      th,     lw,    mid_h)
+        draw_slice("r",   W - rw, th,     rw,    mid_h)
+
+        # Center
+        draw_slice("center", lw, th, mid_w, mid_h)
+
+
 class StickyNote(Gtk.Window):
     def __init__(self, color=None, font=None, start_active=True):
         super().__init__()
@@ -38,25 +153,19 @@ class StickyNote(Gtk.Window):
         self.set_decorated(False)
         self.set_app_paintable(True)
         self.set_icon_name("sticky")
-        
-        # Set window role to group them together in window managers
         self.set_role("stickies-note")
         self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
 
-        # Load settings
         settings = load_settings()
         self.color = color or settings.get("last_color", "yellow")
         self.font_desc = Pango.FontDescription(font or settings.get("last_font", "Geneva-Ori 6"))
 
-        # Save creation + modified dates
         self.creation_date = datetime.datetime.now()
         self.modified_date = self.creation_date
 
-        # Signals
         self.connect("button-press-event", self.on_button_press)
         self.connect("focus-in-event", self.on_focus_in)
         self.connect("focus-out-event", self.on_focus_out)
-        self.connect("size-allocate", self.on_resize)
 
         css = b"""
         textview {
@@ -84,57 +193,62 @@ class StickyNote(Gtk.Window):
 
         self.load_textures()
 
-        min_center = 16
-        min_width = self.pixbufs["l"].get_width() + self.pixbufs["r"].get_width() + min_center
-        min_height = self.pixbufs["t"].get_height() + self.pixbufs["b"].get_height() + min_center
+        # Minimum window size derived from corner/edge pixel dims
+        pb = self.pixbufs_active
+        min_w = pb["l"].get_width() + pb["r"].get_width() + 1
+        min_h = pb["t"].get_height() + pb["b"].get_height() + 1
         geometry = Gdk.Geometry()
-        geometry.min_width = min_width
-        geometry.min_height = min_height
+        geometry.min_width = min_w
+        geometry.min_height = min_h
         self.set_geometry_hints(self, geometry, Gdk.WindowHints.MIN_SIZE)
-        self.set_size_request(min_width, min_height)
+        self.set_size_request(min_w, min_h)
 
-        # --- Main layout: VBox with menubar + overlay ---
+        # --- Layout ---
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add(vbox)
 
         menubar = self.create_menubar()
         vbox.pack_start(menubar, False, False, 0)
 
-        # --- 9-slice grid ---
-        self.grid = Gtk.Grid()
-        self.widgets = {k: Gtk.Image() for k in self.pixbufs.keys()}
-        self.grid.attach(self.widgets["tl"], 0, 0, 1, 1)
-        self.grid.attach(self.widgets["t"], 1, 0, 1, 1)
-        self.grid.attach(self.widgets["tr"], 2, 0, 1, 1)
-        self.grid.attach(self.widgets["l"], 0, 1, 1, 1)
-        self.grid.attach(self.widgets["center"], 1, 1, 1, 1)
-        self.grid.attach(self.widgets["r"], 2, 1, 1, 1)
-        self.grid.attach(self.widgets["bl"], 0, 2, 1, 1)
-        self.grid.attach(self.widgets["b"], 1, 2, 1, 1)
-        self.grid.attach(self.widgets["br"], 2, 2, 1, 1)
+        # Single DrawingArea for entire 9-slice background — zero natural size,
+        # so it never prevents the window from shrinking.
+        self.nine_slice = NineSliceDrawingArea()
+        self.nine_slice.set_pixbufs(self.pixbufs)
 
         overlay = Gtk.Overlay()
-        overlay.add(self.grid)
+        overlay.add(self.nine_slice)
 
-        # Text input
         self.textview = Gtk.TextView()
         self.textview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.textview.set_margin_top(10)
         self.textview.set_margin_start(5)
         self.textview.set_margin_end(5)
         self.textview.modify_font(self.font_desc)
-        overlay.add_overlay(self.textview)
+        self.textview.set_size_request(1, 1)
+        # Wrap TextView in a ScrolledWindow with scrollbars disabled.
+        # This is the canonical GTK3 fix for word-wrap in an Overlay:
+        # ScrolledWindow properly constrains its child's allocated width
+        # to its own width, giving TextView a concrete measure to wrap
+        # against. Without this, Overlay asks the TextView its preferred
+        # width (infinite for unwrapped text) and allocates that, so
+        # long words never wrap and run off the edge of the window.
+        self.scroll = Gtk.ScrolledWindow()
+        self.scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.NEVER)
+        self.scroll.set_size_request(1, 1)
+        self.scroll.set_hexpand(True)
+        self.scroll.set_vexpand(True)
+        self.scroll.set_halign(Gtk.Align.FILL)
+        self.scroll.set_valign(Gtk.Align.FILL)
+        self.scroll.add(self.textview)
+        overlay.add_overlay(self.scroll)
 
-        # Connect buffer change to update modified date
         self.textview.get_buffer().connect("changed", self.on_text_changed)
 
-        # Close button (color-dependent)
         self.close_button = Gtk.Button()
         self.close_button.set_name("close-button")
         self.close_button.set_relief(Gtk.ReliefStyle.NONE)
         self.close_button.set_focus_on_click(False)
         self.update_close_button()
-        # *** CLOSE BUTTON: now destroys the single note instead of quitting whole app ***
         self.close_button.connect("clicked", self.on_close)
         self.close_button.set_halign(Gtk.Align.START)
         self.close_button.set_valign(Gtk.Align.START)
@@ -143,16 +257,39 @@ class StickyNote(Gtk.Window):
         overlay.add_overlay(self.close_button)
         self.close_button.hide()
 
+        # Resize grip — invisible but still interactive (14x14 hit area)
+        grip = Gtk.EventBox()  # EventBox gives us a clickable area with no visual
+        grip.set_size_request(14, 14)
+        grip.set_halign(Gtk.Align.END)
+        grip.set_valign(Gtk.Align.END)
+        grip.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        # Make it completely invisible
+        grip.set_visible_window(False)
+        
+        def _grip_press(w, event):
+            if event.button == 1:
+                self.begin_resize_drag(
+                    Gdk.WindowEdge.SOUTH_EAST, 1,
+                    int(event.x_root), int(event.y_root), event.time)
+        grip.connect('button-press-event', _grip_press)
+        overlay.add_overlay(grip)
         vbox.pack_start(overlay, True, True, 0)
-        self.set_default_size(102, 16)
+        self.set_default_size(102, 62)
 
-        # If caller asked for start_active=False, make sure note appears inactive (no focus visuals)
         if not start_active:
             self.pixbufs = self.pixbufs_inactive
-            self.queue_draw()
+            self.nine_slice.set_pixbufs(self.pixbufs)
             self.close_button.hide()
+        else:
+            # Defer focus grab until the window is fully realized and mapped.
+            # present() raises the window and gives it WM focus; then
+            # grab_focus() routes keyboard input straight into the TextView.
+            def _grab():
+                self.present()
+                self.textview.grab_focus()
+                return False
+            GLib.idle_add(_grab)
 
-    # --- Serialize note for saving ---
     def serialize(self):
         buf = self.textview.get_buffer()
         start, end = buf.get_bounds()
@@ -161,23 +298,18 @@ class StickyNote(Gtk.Window):
         w, h = self.get_size()
         return {
             "text": text,
-            "x": x,
-            "y": y,
-            "width": w,
-            "height": h,
+            "x": x, "y": y,
+            "width": w, "height": h,
             "color": self.color,
             "font": self.font_desc.to_string(),
-            # Add these to preserve dates across sessions
             "creation_date": self.creation_date.isoformat(),
             "modified_date": self.modified_date.isoformat()
         }
 
-    # --- Load textures depending on color ---
     def load_textures(self):
         color_dir = os.path.join(BASE_DIR, "colors", self.color)
-        self.pixbufs_active = self.load_pixbufs(color_dir, "")
+        self.pixbufs_active   = self.load_pixbufs(color_dir, "")
         self.pixbufs_inactive = self.load_pixbufs(color_dir, "_inactive")
-        # default to active until explicitly made inactive by caller
         self.pixbufs = self.pixbufs_active
 
     def load_pixbufs(self, base_dir, suffix):
@@ -194,16 +326,13 @@ class StickyNote(Gtk.Window):
         }
 
     def update_close_button(self):
-        color_dir = os.path.join(BASE_DIR, self.color)
         close_path = os.path.join(BASE_DIR, "colors", self.color, "close_texture1.png")
         if os.path.exists(close_path):
             close_pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(close_path, 7, 7)
             self.close_button.set_image(Gtk.Image.new_from_pixbuf(close_pixbuf))
 
-    # --- Menu creation ---
     def create_menubar(self):
         menubar = Gtk.MenuBar()
-        # File menu
         filemenu = Gtk.Menu()
         file_item = Gtk.MenuItem(label="File")
         file_item.set_submenu(filemenu)
@@ -216,7 +345,6 @@ class StickyNote(Gtk.Window):
         quit_item = Gtk.MenuItem(label="Quit")
         quit_item.connect("activate", self.on_quit)
         filemenu.append(quit_item)
-        # Edit menu
         editmenu = Gtk.Menu()
         edit_item = Gtk.MenuItem(label="Edit")
         edit_item.set_submenu(editmenu)
@@ -226,7 +354,6 @@ class StickyNote(Gtk.Window):
         paste_item = Gtk.MenuItem(label="Paste")
         paste_item.connect("activate", self.on_paste)
         editmenu.append(paste_item)
-        # Note menu
         notemenu = Gtk.Menu()
         note_item = Gtk.MenuItem(label="Note")
         note_item.set_submenu(notemenu)
@@ -236,7 +363,6 @@ class StickyNote(Gtk.Window):
         info_item = Gtk.MenuItem(label="Note Info")
         info_item.connect("activate", self.on_note_info)
         notemenu.append(info_item)
-        # Color menu
         colormenu = Gtk.Menu()
         color_item = Gtk.MenuItem(label="Color")
         color_item.set_submenu(colormenu)
@@ -246,14 +372,12 @@ class StickyNote(Gtk.Window):
             mi = Gtk.MenuItem(label=label)
             mi.connect("activate", self.on_change_color, c)
             colormenu.append(mi)
-        # Help menu
         helpmenu = Gtk.Menu()
         help_item = Gtk.MenuItem(label="Help")
         help_item.set_submenu(helpmenu)
         about_item = Gtk.MenuItem(label="About")
         about_item.connect("activate", self.on_about)
         helpmenu.append(about_item)
-        # Append all
         menubar.append(file_item)
         menubar.append(edit_item)
         menubar.append(note_item)
@@ -261,7 +385,6 @@ class StickyNote(Gtk.Window):
         menubar.append(help_item)
         return menubar
 
-    # --- Menu handlers ---
     def on_new_note(self, widget):
         settings = load_settings()
         note = StickyNote(
@@ -269,22 +392,18 @@ class StickyNote(Gtk.Window):
             font=settings.get("last_font", "Geneva-Ori 6")
         )
         note.show_all()
-        # register it with the app and ensure correct cleanup
         app.notes.append(note)
-        # connect destroy to app.note_closed (so removing single notes works properly)
         note.connect("destroy", lambda w, n=note: app.note_closed(n))
 
     def on_save_as(self, widget):
         dialog = Gtk.FileChooserDialog(
-            title="Save Note As",
-            parent=self,
+            title="Save Note As", parent=self,
             action=Gtk.FileChooserAction.SAVE,
             buttons=(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
                      Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
         )
         dialog.set_do_overwrite_confirmation(True)
         dialog.set_current_name("note.txt")
-
         response = dialog.run()
         if response == Gtk.ResponseType.OK:
             filename = dialog.get_filename()
@@ -306,28 +425,24 @@ class StickyNote(Gtk.Window):
         dialog.set_font_desc(self.font_desc)
         response = dialog.run()
         if response == Gtk.ResponseType.OK:
-            font_desc = dialog.get_font_desc()
-            self.font_desc = font_desc
-            self.textview.modify_font(font_desc)
+            self.font_desc = dialog.get_font_desc()
+            self.textview.modify_font(self.font_desc)
         dialog.destroy()
 
     def on_note_info(self, widget):
-        created_str = self.creation_date.strftime("%a, %b %d, %Y, %I:%M %p")
+        created_str  = self.creation_date.strftime("%a, %b %d, %Y, %I:%M %p")
         modified_str = self.modified_date.strftime("%a, %b %d, %Y, %I:%M %p")
         md = Gtk.MessageDialog(
-            transient_for=self,
-            flags=0,
+            transient_for=self, flags=0,
             message_type=Gtk.MessageType.INFO,
             buttons=Gtk.ButtonsType.OK,
         )
         md.set_title("Note Info")
         md.format_secondary_text(f"Created:       {created_str}\nLast Modified:  {modified_str}")
-
         icon_path = os.path.join(BASE_DIR, "when.png")
         if os.path.exists(icon_path):
             pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(icon_path, 32, 32)
             md.set_image(Gtk.Image.new_from_pixbuf(pixbuf))
-
         md.run()
         md.destroy()
 
@@ -335,7 +450,7 @@ class StickyNote(Gtk.Window):
         self.color = color
         self.load_textures()
         self.update_close_button()
-        self.queue_resize()
+        self.nine_slice.set_pixbufs(self.pixbufs)
         settings = load_settings()
         settings["last_color"] = color
         save_settings(settings)
@@ -344,52 +459,21 @@ class StickyNote(Gtk.Window):
         about = Gtk.AboutDialog(transient_for=self, modal=True)
         about.set_program_name("Stickies")
         about.set_version("2.1")
-        about.set_comments("Reacreation of Stickeys from mac OS 9")
+        about.set_comments("Recreation of Stickies from Mac OS 9")
         about.run()
         about.destroy()
 
-    # --- Track modifications ---
     def on_text_changed(self, buffer):
         self.modified_date = datetime.datetime.now()
-    def on_resize(self, widget, allocation):
-        w, h = allocation.width, allocation.height
-        lw = self.pixbufs["l"].get_width()
-        rw = self.pixbufs["r"].get_width()
-        th = self.pixbufs["t"].get_height()
-        bh = self.pixbufs["b"].get_height()
-        mid_w = max(32, w - lw - rw)
-        mid_h = max(32, h - th - bh)
-
-        for corner in ["tl", "tr", "bl", "br"]:
-            self.widgets[corner].set_from_pixbuf(self.pixbufs[corner])
-
-        # Top edge tiling
-        t_pix = self.pixbufs["t"]
-        t_width, t_height = t_pix.get_width(), t_pix.get_height()
-        t_tile = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, mid_w, t_height)
-        x = 0
-        while x < mid_w:
-            w_part = min(t_width, mid_w - x)
-            sub = t_pix.new_subpixbuf(0, 0, w_part, t_height)
-            sub.composite(t_tile, x, 0, w_part, t_height, x, 0, 1.0, 1.0, GdkPixbuf.InterpType.NEAREST, 255)
-            x += w_part
-        self.widgets["t"].set_from_pixbuf(t_tile)
-
-        self.widgets["b"].set_from_pixbuf(self.pixbufs["b"].scale_simple(mid_w, bh, GdkPixbuf.InterpType.BILINEAR))
-        self.widgets["l"].set_from_pixbuf(self.pixbufs["l"].scale_simple(lw, mid_h, GdkPixbuf.InterpType.BILINEAR))
-        self.widgets["r"].set_from_pixbuf(self.pixbufs["r"].scale_simple(rw, mid_h, GdkPixbuf.InterpType.BILINEAR))
-        self.widgets["center"].set_from_pixbuf(self.pixbufs["center"].scale_simple(mid_w, mid_h, GdkPixbuf.InterpType.BILINEAR))
 
     def on_focus_in(self, *args):
-        # When focused, show active textures and close button
         self.pixbufs = self.pixbufs_active
-        self.queue_draw()
+        self.nine_slice.set_pixbufs(self.pixbufs)
         self.close_button.show()
 
     def on_focus_out(self, *args):
-        # When unfocused, show inactive textures and hide close button
         self.pixbufs = self.pixbufs_inactive
-        self.queue_draw()
+        self.nine_slice.set_pixbufs(self.pixbufs)
         self.close_button.hide()
 
     def on_button_press(self, widget, event):
@@ -415,27 +499,23 @@ class StickyNote(Gtk.Window):
             elif x > w - border:
                 self.begin_resize_drag(Gdk.WindowEdge.EAST, 1, int(event.x_root), int(event.y_root), event.time)
 
-            move_left = (w - move_zone_width) // 2
+            move_left  = (w - move_zone_width) // 2
             move_right = move_left + move_zone_width
             if y < titlebar_height and move_left <= x <= move_right:
                 self.begin_move_drag(1, int(event.x_root), int(event.y_root), event.time)
 
-    # *** Single-note close: destroy this window (do not quit full app) ***
     def on_close(self, button):
-        # Destroying will trigger app.note_closed through connected signal
         self.destroy()
 
     def on_quit(self, widget):
-        # Quit menu quits the whole program and saves visible notes
         app.save_and_quit()
 
 
-# --- Controller to handle multiple notes ---
 class StickyApp:
     def __init__(self):
         self.notes = []
         self.settings = load_settings()
-        
+
         self.parent_window = Gtk.Window()
         self.parent_window.hide()
 
@@ -443,28 +523,17 @@ class StickyApp:
         self.server_thread = None
         self._start_socket_server()
 
-        # Restore saved notes
         for note_data in self.settings.get("notes", []):
-            # start_active=False so restored notes don't remember "focus"
             note = StickyNote(color=note_data.get("color"), font=note_data.get("font"), start_active=False)
             note.show_all()
-
             buf = note.textview.get_buffer()
             buf.set_text(note_data.get("text", ""))
-
-            x = note_data.get("x", 100)
-            y = note_data.get("y", 100)
-            w = note_data.get("width", 200)
-            h = note_data.get("height", 200)
-            note.move(x, y)
-            note.resize(w, h)
-            
-            # Restore saved dates if they exist in the data
+            note.move(note_data.get("x", 100), note_data.get("y", 100))
+            note.resize(note_data.get("width", 102), note_data.get("height", 62))
             if "creation_date" in note_data:
                 note.creation_date = datetime.datetime.fromisoformat(note_data["creation_date"])
             if "modified_date" in note_data:
                 note.modified_date = datetime.datetime.fromisoformat(note_data["modified_date"])
-
             self.notes.append(note)
             note.connect("destroy", lambda w, n=note: self.note_closed(n))
 
@@ -474,21 +543,13 @@ class StickyApp:
             self.notes.append(n)
             n.connect("destroy", lambda w, n=n: self.note_closed(n))
 
-    # Called when a note is closed/destroyed - remove from list and update saved settings
     def note_closed(self, note):
         try:
             if note in self.notes:
                 self.notes.remove(note)
         except Exception:
             traceback.print_exc()
-        # After removing a note, save current visible notes (so deletion persists)
         self.save_settings_now()
-        # If there are no visible notes left, quit the app
-        if not any(win.is_visible() for win in self.notes):
-            self.save_and_quit()
-
-    def on_any_note_closed(self, *args):
-        # Legacy compatibility (not used in this refactor)
         if not any(win.is_visible() for win in self.notes):
             self.save_and_quit()
 
@@ -497,45 +558,33 @@ class StickyApp:
         save_settings(data)
 
     def save_and_quit(self):
-        # Save visible notes, stop socket server, then quit
         try:
             data = {"notes": [note.serialize() for note in self.notes if note.is_visible()]}
             save_settings(data)
         except Exception:
             traceback.print_exc()
-        # stop server and cleanup socket file
         self._stop_socket_server()
         Gtk.main_quit()
 
-    # --- Single-instance socket server ---
     def _start_socket_server(self):
-        # Try to create a UNIX domain socket to act as the single-instance server.
-        # If the bind fails because socket exists / in use, we will try to connect and send a "NEW" message.
         try:
-            # Ensure old socket file not left behind (stale)
             if os.path.exists(SOCKET_PATH):
                 try:
-                    # Try connecting first to determine if someone is listening.
                     scheck = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                     scheck.settimeout(0.1)
                     scheck.connect(SOCKET_PATH)
-                    # If connect succeeded, someone is listening. Send request to open new note and exit.
                     try:
                         scheck.sendall(b"NEW\n")
                     except Exception:
                         pass
                     scheck.close()
-                    # Inform caller to exit the process (we don't start a duplicate instance)
-                    # Note: we raise SystemExit to end this process
                     raise SystemExit(0)
                 except (socket.error, SystemExit):
-                    # Either no listener or we exited. If no listener, remove stale socket file and continue to bind
                     try:
                         os.unlink(SOCKET_PATH)
                     except Exception:
                         pass
 
-            # Bind server socket
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             server.bind(SOCKET_PATH)
             server.listen(1)
@@ -546,7 +595,6 @@ class StickyApp:
                     try:
                         conn, _ = server.accept()
                         data = b""
-                        # read a short message
                         try:
                             conn.settimeout(1.0)
                             data = conn.recv(1024)
@@ -561,24 +609,19 @@ class StickyApp:
                             continue
                         msg = data.decode(errors="ignore").strip().upper()
                         if msg == "NEW":
-                            # schedule new note creation on the main thread
                             GLib.idle_add(self._create_new_note_from_signal)
                     except Exception:
-                        # if server socket closed (on quit) break out
                         break
 
             self.server_thread = threading.Thread(target=server_loop, daemon=True)
             self.server_thread.start()
         except SystemExit:
-            # Means another instance handled the signal and we should quit (already signaled earlier)
             raise
         except Exception:
-            # If anything goes wrong with single-instance server, fall back to no-op server and continue
             traceback.print_exc()
             self.server = None
 
     def _create_new_note_from_signal(self):
-        # Called in main thread when another process requested a new note
         settings = load_settings()
         note = StickyNote(
             color=settings.get("last_color", "yellow"),
@@ -593,12 +636,10 @@ class StickyApp:
         try:
             if self.server:
                 try:
-                    # close the server socket to break accept()
                     self.server.close()
                 except Exception:
                     pass
                 self.server = None
-            # remove socket file if exists
             if os.path.exists(SOCKET_PATH):
                 try:
                     os.unlink(SOCKET_PATH)
@@ -608,11 +649,9 @@ class StickyApp:
             traceback.print_exc()
 
 
-# --- Main entry ---
 if __name__ == "__main__":
     try:
         app = StickyApp()
     except SystemExit:
-        # Another instance handled the request (sent NEW), so exit quietly
         raise SystemExit(0)
     Gtk.main()
